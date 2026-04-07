@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@keyframes slide-in {
+  from { transform: translateX(100%); opacity: 0; }
+  to   { transform: translateX(0);    opacity: 1; }
+}
+
+.animate-slide-in {
+  animation: slide-in 0.22s ease-out forwards;
+}
+
+@keyframes toast-in {
+  from { transform: translateY(16px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+
+@keyframes toast-out {
+  from { transform: translateY(0);    opacity: 1; }
+  to   { transform: translateY(16px); opacity: 0; }
+}
+
+.animate-toast-in {
+  animation: toast-in 0.25s ease-out forwards;
+}
+
+.animate-toast-out {
+  animation: toast-out 0.25s ease-in forwards;
+}
