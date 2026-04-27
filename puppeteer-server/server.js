@@ -229,7 +229,7 @@ app.post('/record', async (req, res) => {
   const page = await browser.newPage();
 
   try {
-    await page.setViewport({ width, height, deviceScaleFactor: 1 });
+    await page.setViewport({ width, height, deviceScaleFactor: 3 });
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'ko-KR,ko;q=0.9' });
 
     // 클릭 타임스탬프 추적 코드 주입
@@ -237,15 +237,17 @@ app.post('/record', async (req, res) => {
 
     await page.setContent(instrumentedHtml, { waitUntil: 'networkidle0', timeout: 30000 });
     await waitForFontsAndImages(page);
+    await new Promise(r => setTimeout(r, 1000)); // 폰트·이미지 렌더 안정화
 
     // ── 1단계: 실시간 녹화 (ultrafast — CPU 부담 최소화) ──
     const recorder = new PuppeteerScreenRecorder(page, {
       followNewTab: false,
-      fps: 25,
+      fps: 30,
       videoFrame: { width, height },
-      videoCrf: 23,            // 1차 품질은 의미없음 (어차피 재인코딩)
+      videoCrf: 18,
+      videoBitrate: 8000,      // 8Mbps 고화질
       videoCodec: 'libx264',
-      videoPreset: 'ultrafast', // 실시간 캡처는 ultrafast 필수
+      videoPreset: 'slow',     // 압축 효율 극대화
       autopad: { color: '#000000' },
     });
 
