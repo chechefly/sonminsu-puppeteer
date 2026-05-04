@@ -62,17 +62,25 @@ async function waitForFontsAndImages(page) {
   });
 }
 
-// ── 클릭 타임스탬프 추적 코드를 HTML에 주입 ──────────
-// run() 호출 직전에 playClick() 래핑 코드 삽입
+// ── 사운드 타임스탬프 추적 코드를 HTML에 주입 ──────────
+// run() 호출 직전에 playClick/playSwipe/playShutter/playVault 래핑
 function injectClickTracking(html) {
   const trackingCode = `
 window._animStart = Date.now();
-window._clickTimes = [];
-const __origPlayClick = typeof playClick === 'function' ? playClick : null;
-playClick = function(){
-  window._clickTimes.push(Date.now() - window._animStart);
-  if(__origPlayClick) __origPlayClick();
-};
+window._clickTimes   = [];
+window._swipeTimes   = [];
+window._shutterTimes = [];
+window._vaultTimes   = [];
+function __wrap(fn, arr){
+  return function(){
+    arr.push(Date.now() - window._animStart);
+    if(fn) fn.apply(this, arguments);
+  };
+}
+if(typeof playClick   === 'function') playClick   = __wrap(playClick,   window._clickTimes);
+if(typeof playSwipe   === 'function') playSwipe   = __wrap(playSwipe,   window._swipeTimes);
+if(typeof playShutter === 'function') playShutter = __wrap(playShutter, window._shutterTimes);
+if(typeof playVault   === 'function') playVault   = __wrap(playVault,   window._vaultTimes);
 `;
   // run() 호출 직전에 삽입 (마지막 run() 찾기)
   const lastRunIdx = html.lastIndexOf('run()');
@@ -80,36 +88,87 @@ playClick = function(){
   return html.slice(0, lastRunIdx) + trackingCode + html.slice(lastRunIdx);
 }
 
-// ── WAV 생성: 클릭 소리를 정확한 시점에 배치 ─────────
-// 원본 playClick()의 노이즈 버스트를 재현
-// envelope: (1 - i/len)^6 × 0.88, 길이 58ms
-function generateClickWav(clickTimesMs, totalDurationSec, sampleRate = 44100) {
-  const totalSamples = Math.ceil(totalDurationSec * sampleRate);
-  const pcm = new Int16Array(totalSamples); // 16-bit PCM, 초기값 0(무음)
+// ── PCM 믹스 헬퍼 (클램프 합산) ──────────────────────
+function mixSample(pcm, idx, val) {
+  if (idx < 0 || idx >= pcm.length) return;
+  const sum = pcm[idx] / 32767 + val;
+  pcm[idx] = Math.round(Math.max(-1, Math.min(1, sum)) * 32767);
+}
 
-  const clickLen = Math.floor(0.058 * sampleRate); // ~2557 samples
-
-  for (const tMs of clickTimesMs) {
-    const startSample = Math.floor((tMs / 1000) * sampleRate);
-    for (let i = 0; i < clickLen; i++) {
-      const idx = startSample + i;
-      if (idx >= totalSamples) break;
-      const envelope = Math.pow(1 - i / clickLen, 6) * 0.88;
-      const noise = (Math.random() * 2 - 1) * envelope;
-      // 기존 값에 합산 후 클램프
-      const sum = pcm[idx] / 32767 + noise;
-      pcm[idx] = Math.round(Math.max(-1, Math.min(1, sum)) * 32767);
-    }
+// ── 클릭 소리: 58ms 노이즈 버스트, (1-t)^6 * 0.88 ──
+function addClick(pcm, startMs, totalSamples, sr = 44100) {
+  const start = Math.floor((startMs / 1000) * sr);
+  const len = Math.floor(0.058 * sr);
+  for (let i = 0; i < len; i++) {
+    const env = Math.pow(1 - i / len, 6) * 0.88;
+    mixSample(pcm, start + i, (Math.random() * 2 - 1) * env);
   }
+}
 
-  // WAV 헤더 (PCM mono 16-bit)
+// ── 휙 소리: 170ms 고주파 강조 노이즈 스윕 ───────────
+function addSwipe(pcm, startMs, totalSamples, sr = 44100) {
+  const start = Math.floor((startMs / 1000) * sr);
+  const len = Math.floor(0.17 * sr);
+  const raw = new Float32Array(len);
+  for (let i = 0; i < len; i++) {
+    const t = i / len;
+    const env = Math.pow(Math.min(t * 18, 1), 0.18) * Math.pow(1 - t, 2.0) * 0.7;
+    raw[i] = (Math.random() * 2 - 1) * env;
+  }
+  // 고주파 강조 (차분 필터)
+  for (let i = len - 1; i > 0; i--) raw[i] = raw[i] * 0.72 - raw[i-1] * 0.28;
+  for (let i = 0; i < len; i++) mixSample(pcm, start + i, raw[i] * 1.2);
+}
+
+// ── 찰칵 소리: 두 번 노이즈 버스트 (38ms + 32ms) ─────
+function addShutter(pcm, startMs, totalSamples, sr = 44100) {
+  const start = Math.floor((startMs / 1000) * sr);
+  // 1차 클릭
+  const len1 = Math.floor(0.038 * sr);
+  for (let i = 0; i < len1; i++) {
+    const env = Math.pow(1 - i / len1, 4);
+    mixSample(pcm, start + i, (Math.random() * 2 - 1) * env);
+  }
+  // 2차 클릭 (65ms 후, 0.62배 음량)
+  const off2 = Math.floor(0.065 * sr);
+  const len2 = Math.floor(0.032 * sr);
+  for (let i = 0; i < len2; i++) {
+    const env = Math.pow(1 - i / len2, 4) * 0.62;
+    mixSample(pcm, start + off2 + i, (Math.random() * 2 - 1) * env);
+  }
+}
+
+// ── 치킹 소리: 노이즈 임팩트 + 삼각파 금속 링 ────────
+function addVault(pcm, startMs, totalSamples, sr = 44100) {
+  const start = Math.floor((startMs / 1000) * sr);
+  // 임팩트 노이즈 55ms
+  const len1 = Math.floor(0.055 * sr);
+  for (let i = 0; i < len1; i++) {
+    const env = Math.pow(1 - i / len1, 3) * 0.95;
+    mixSample(pcm, start + i, (Math.random() * 2 - 1) * env);
+  }
+  // 금속 링: 주파수 스윕 (4400→750Hz), 삼각파, 320ms
+  const len2 = Math.floor(0.32 * sr);
+  let phase = 0;
+  for (let i = 0; i < len2; i++) {
+    const t = i / sr;
+    const freq = 4400 * Math.exp(-t * 12.5); // 지수 스윕
+    phase += (2 * Math.PI * freq) / sr;
+    const tri = (2 / Math.PI) * Math.asin(Math.sin(phase));
+    const env = Math.exp(-t * 18) * 0.52;
+    mixSample(pcm, start + i, tri * env);
+  }
+}
+
+// ── WAV 헤더 생성 ────────────────────────────────────
+function buildWavBuffer(pcm, sampleRate = 44100) {
   const dataBytes = pcm.length * 2;
   const header = Buffer.alloc(44);
   header.write('RIFF', 0);
   header.writeUInt32LE(36 + dataBytes, 4);
   header.write('WAVE', 8);
   header.write('fmt ', 12);
-  header.writeUInt32LE(16, 16);          // chunk size
+  header.writeUInt32LE(16, 16);
   header.writeUInt16LE(1, 20);           // PCM
   header.writeUInt16LE(1, 22);           // mono
   header.writeUInt32LE(sampleRate, 24);
@@ -118,8 +177,20 @@ function generateClickWav(clickTimesMs, totalDurationSec, sampleRate = 44100) {
   header.writeUInt16LE(16, 34);
   header.write('data', 36);
   header.writeUInt32LE(dataBytes, 40);
-
   return Buffer.concat([header, Buffer.from(pcm.buffer)]);
+}
+
+// ── 전체 오디오 WAV 생성 (클릭·휙·찰칵·치킹 믹스) ────
+function generateAudioWav(soundEvents, totalDurationSec, sampleRate = 44100) {
+  const totalSamples = Math.ceil(totalDurationSec * sampleRate);
+  const pcm = new Int16Array(totalSamples);
+
+  for (const tMs of (soundEvents.clicks   || [])) addClick(pcm, tMs, totalSamples, sampleRate);
+  for (const tMs of (soundEvents.swipes   || [])) addSwipe(pcm, tMs, totalSamples, sampleRate);
+  for (const tMs of (soundEvents.shutters || [])) addShutter(pcm, tMs, totalSamples, sampleRate);
+  for (const tMs of (soundEvents.vaults   || [])) addVault(pcm, tMs, totalSamples, sampleRate);
+
+  return buildWavBuffer(pcm, sampleRate);
 }
 
 // ── ffmpeg: 고화질 재인코딩 (medium preset) ──────────
@@ -229,7 +300,7 @@ app.post('/record', async (req, res) => {
   const page = await browser.newPage();
 
   try {
-    await page.setViewport({ width, height, deviceScaleFactor: 3 });
+    await page.setViewport({ width, height, deviceScaleFactor: 1 });
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'ko-KR,ko;q=0.9' });
 
     // 클릭 타임스탬프 추적 코드 주입
@@ -237,17 +308,15 @@ app.post('/record', async (req, res) => {
 
     await page.setContent(instrumentedHtml, { waitUntil: 'networkidle0', timeout: 30000 });
     await waitForFontsAndImages(page);
-    await new Promise(r => setTimeout(r, 1000)); // 폰트·이미지 렌더 안정화
 
     // ── 1단계: 실시간 녹화 (ultrafast — CPU 부담 최소화) ──
     const recorder = new PuppeteerScreenRecorder(page, {
       followNewTab: false,
-      fps: 30,
+      fps: 25,
       videoFrame: { width, height },
-      videoCrf: 18,
-      videoBitrate: 8000,      // 8Mbps 고화질
+      videoCrf: 23,            // 1차 품질은 의미없음 (어차피 재인코딩)
       videoCodec: 'libx264',
-      videoPreset: 'slow',     // 압축 효율 극대화
+      videoPreset: 'ultrafast', // 실시간 캡처는 ultrafast 필수
       autopad: { color: '#000000' },
     });
 
@@ -255,9 +324,15 @@ app.post('/record', async (req, res) => {
     await new Promise(r => setTimeout(r, (duration + 1) * 1000));
     await recorder.stop();
 
-    // 클릭 타임스탬프 회수
-    const clickTimes = await page.evaluate(() => window._clickTimes || []);
-    console.log(`[record] 클릭 타임스탬프 ${clickTimes.length}개:`, clickTimes);
+    // 사운드 타임스탬프 회수 (클릭·휙·찰칵·치킹)
+    const soundEvents = await page.evaluate(() => ({
+      clicks:   window._clickTimes   || [],
+      swipes:   window._swipeTimes   || [],
+      shutters: window._shutterTimes || [],
+      vaults:   window._vaultTimes   || [],
+    }));
+    const totalSounds = Object.values(soundEvents).reduce((s,a) => s+a.length, 0);
+    console.log(`[record] 사운드 이벤트 총 ${totalSounds}개:`, soundEvents);
 
     // ── 2단계: 고화질 재인코딩 (medium preset) ───────────
     // 녹화가 끝난 후라 시간 제약 없음 → medium preset으로 블록 아티팩트 제거
@@ -271,10 +346,10 @@ app.post('/record', async (req, res) => {
       console.error('[record] 재인코딩 실패, 원본 사용:', reErr.message);
     }
 
-    // ── 3단계: 클릭 소리 믹싱 ───────────────────────────
+    // ── 3단계: 사운드 믹싱 (클릭·휙·찰칵·치킹) ─────────
     let finalVideoPath = hqVideoPath;
-    if (clickTimes.length > 0) {
-      const wavBuf = generateClickWav(clickTimes, duration + 2);
+    if (totalSounds > 0) {
+      const wavBuf = generateAudioWav(soundEvents, duration + 2);
       fs.writeFileSync(audioWav, wavBuf);
       try {
         await mergeAudioToVideo(hqVideoPath, audioWav, videoOut);
