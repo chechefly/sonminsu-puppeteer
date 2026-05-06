@@ -65,8 +65,11 @@ async function waitForFontsAndImages(page) {
 // ── 사운드 타임스탬프 추적 코드를 HTML에 주입 ──────────
 // run() 호출 직전에 playClick/playSwipe/playShutter/playVault 래핑
 function injectClickTracking(html) {
+  // run() 자동 실행을 막고 window.__pendingRun 으로 노출만 해둠.
+  // 실제 run() 호출은 recorder.start() 직후 서버가 page.evaluate()로 킥오프.
+  // → _animStart 세팅 시점 = 녹화 시작 시점 → 소리·영상 완벽 동기화.
   const trackingCode = `
-window._animStart = Date.now();
+window._animStart = 0;
 window._clickTimes   = [];
 window._swipeTimes   = [];
 window._shutterTimes = [];
@@ -81,11 +84,12 @@ if(typeof playClick   === 'function') playClick   = __wrap(playClick,   window._
 if(typeof playSwipe   === 'function') playSwipe   = __wrap(playSwipe,   window._swipeTimes);
 if(typeof playShutter === 'function') playShutter = __wrap(playShutter, window._shutterTimes);
 if(typeof playVault   === 'function') playVault   = __wrap(playVault,   window._vaultTimes);
+window.__pendingRun = run;
 `;
-  // run() 호출 직전에 삽입 (마지막 run() 찾기)
+  // 마지막 run() 호출을 추적 코드로 교체 (run() 자동 실행 제거)
   const lastRunIdx = html.lastIndexOf('run()');
   if (lastRunIdx === -1) return html;
-  return html.slice(0, lastRunIdx) + trackingCode + html.slice(lastRunIdx);
+  return html.slice(0, lastRunIdx) + trackingCode + html.slice(lastRunIdx + 'run()'.length);
 }
 
 // ── PCM 믹스 헬퍼 (클램프 합산) ──────────────────────
@@ -321,6 +325,11 @@ app.post('/record', async (req, res) => {
     });
 
     await recorder.start(videoRaw);
+    // 녹화 시작 직후 _animStart 세팅 + run() 킥오프 → 소리 타임스탬프 = 영상 기준점 일치
+    await page.evaluate(() => {
+      window._animStart = Date.now();
+      window.__pendingRun();
+    });
     await new Promise(r => setTimeout(r, (duration + 1) * 1000));
     await recorder.stop();
 
