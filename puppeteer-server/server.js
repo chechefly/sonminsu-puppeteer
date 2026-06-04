@@ -383,6 +383,29 @@ app.post('/record', async (req, res) => {
   }
 });
 
+// ── /buffer-proxy ─────────────────────────────────
+// 브라우저(file:// origin)에서 api.buffer.com 직접 호출 시 CORS 차단됨
+// → 이 엔드포인트로 프록시해서 서버-to-서버로 Buffer API 호출
+app.post('/buffer-proxy', async (req, res) => {
+  const { query, variables, token } = req.body;
+  if (!token) return res.status(400).json({ error: 'token required' });
+  try {
+    const r = await fetch('https://api.buffer.com/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({ query, variables }),
+    });
+    const data = await r.json();
+    res.status(r.status).json(data);
+  } catch (err) {
+    console.error('[/buffer-proxy]', err.message);
+    res.status(502).json({ error: `Buffer API 호출 실패: ${err.message}` });
+  }
+});
+
 // ── Start ─────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
