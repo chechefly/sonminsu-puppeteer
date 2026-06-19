@@ -6,6 +6,14 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFile } = require('child_process');
+const cron = require('node-cron');
+
+// ── Supabase / Instagram 환경변수 ──────────────────
+const SUPA_URL   = process.env.SUPABASE_URL   || 'https://yimpivkerkoustifzlqm.supabase.co';
+const SUPA_KEY   = process.env.SUPABASE_KEY   || '';
+const IG_TOKEN   = process.env.INSTAGRAM_ACCESS_TOKEN || '';
+const IG_ACCOUNT = process.env.INSTAGRAM_ACCOUNT_ID  || '17841435430630928';
+const IG_BASE    = 'https://graph.facebook.com/v19.0';
 
 const app = express();
 app.use(cors());
@@ -404,6 +412,132 @@ app.post('/buffer-proxy', async (req, res) => {
     console.error('[/buffer-proxy]', err.message);
     res.status(502).json({ error: `Buffer API 호출 실패: ${err.message}` });
   }
+});
+
+// ══════════════════════════════════════════════════
+// INSTAGRAM INSIGHTS AUTO-SYNC
+// ══════════════════════════════════════════════════
+
+async function fetchIgMedia() {
+  const url = `${IG_BASE}/${IG_ACCOUNT}/media?fields=id,caption,timestamp,media_type,permalink&limit=50&access_token=${IG_TOKEN}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Instagram media 조회 실패: ${r.status}`);
+  const d = await r.json();
+  return d.data || [];
+}
+
+async function fetchIgInsights(mediaId) {
+  const metrics = 'plays,reach,likes,comments,saved,shares,total_interactions';
+  const url = `${IG_BASE}/${mediaId}/insights?metric=${metrics}&access_token=${IG_TOKEN}`;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  const d = await r.json();
+  const result = {};
+  for (const m of (d.data || [])) result[m.name] = m.values?.[0]?.value ?? m.value ?? null;
+  return result;
+}
+
+async function supaGet(path, params = '') {
+  const r = await fetch(`${SUPA_URL}/rest/v1/${path}${params}`, {
+    headers: { apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}` },
+  });
+  if (!r.ok) throw new Error(`Supabase GET 실패: ${r.status}`);
+  return r.json();
+}
+
+async function supaPatch(path, params, body) {
+  const r = await fetch(`${SUPA_URL}/rest/v1/${path}${params}`, {
+    method: 'PATCH',
+    headers: {
+      apikey: SUPA_KEY, Authorization: `Bearer ${SUPA_KEY}`,
+      'Content-Type': 'application/json', Prefer: 'return=minimal',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`Supabase PATCH 실패: ${r.status}`);
+}
+
+async function syncInsights() {
+  if (!IG_TOKEN || !SUPA_KEY) {
+    console.warn('[sync] INSTAGRAM_ACCESS_TOKEN 또는 SUPABASE_KEY 환경변수 없음 — 스킵');
+    return { matched: 0, insights: 0 };
+  }
+
+  let matched = 0, insights = 0;
+  const now = new Date().toISOString();
+
+  // 1. media_id 없고 buffer 예약 시각이 지난 행 조회
+  const pending = await supaGet(
+    'reels_log',
+    `?instagram_media_id=is.null&buffer_scheduled_at=lt.${now}&select=id,title,celeb,buffer_scheduled_at`
+  );
+  console.log(`[sync] media_id 미연결 ${pending.length}개`);
+
+  if (pending.length > 0) {
+    const igMedia = await fetchIgMedia();
+    console.log(`[sync] Instagram 최근 미디어 ${igMedia.length}개`);
+
+    for (const row of pending) {
+      const scheduled = new Date(row.buffer_scheduled_at).getTime();
+      // buffer_scheduled_at ± 4시간 이내 Instagram 게시물 매칭
+      const match = igMedia.find(m => {
+        const diff = Math.abs(new Date(m.timestamp).getTime() - scheduled);
+        return diff < 4 * 60 * 60 * 1000;
+      });
+      if (!match) continue;
+
+      await supaPatch('reels_log', `?id=eq.${row.id}`, {
+        instagram_media_id: match.id,
+        instagram_posted_at: match.timestamp,
+      });
+      console.log(`[sync] 매칭 완료: ${row.celeb || row.title} → ${match.id}`);
+      matched++;
+    }
+  }
+
+  // 2. media_id 있고 인사이트 미조회(또는 1일 이상 된) 행 갱신
+  const toUpdate = await supaGet(
+    'reels_log',
+    `?instagram_media_id=not.is.null&or=(insights_fetched_at.is.null,insights_fetched_at.lt.${new Date(Date.now() - 86400000).toISOString()})&select=id,instagram_media_id`
+  );
+  console.log(`[sync] 인사이트 갱신 대상 ${toUpdate.length}개`);
+
+  for (const row of toUpdate) {
+    const ins = await fetchIgInsights(row.instagram_media_id);
+    if (!ins) continue;
+    await supaPatch('reels_log', `?id=eq.${row.id}`, {
+      insights_fetched_at: new Date().toISOString(),
+      views:              ins.plays             ?? null,
+      reach:              ins.reach             ?? null,
+      likes:              ins.likes             ?? null,
+      comments:           ins.comments          ?? null,
+      saves:              ins.saved             ?? null,
+      shares:             ins.shares            ?? null,
+      total_interactions: ins.total_interactions ?? null,
+    });
+    console.log(`[sync] 인사이트 저장: ${row.instagram_media_id}`);
+    insights++;
+  }
+
+  console.log(`[sync] 완료 — 매칭 ${matched}개, 인사이트 ${insights}개`);
+  return { matched, insights };
+}
+
+// ── /sync-insights 수동 트리거 엔드포인트 ──────────
+app.post('/sync-insights', async (req, res) => {
+  try {
+    const result = await syncInsights();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('[sync] 오류:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── 매일 오전 10시 (한국 시간 = UTC 01:00) 자동 실행 ──
+cron.schedule('0 1 * * *', () => {
+  console.log('[cron] 매일 인사이트 동기화 시작');
+  syncInsights().catch(e => console.error('[cron] 오류:', e.message));
 });
 
 // ── Start ─────────────────────────────────────────
